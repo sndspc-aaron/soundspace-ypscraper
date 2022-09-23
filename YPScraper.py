@@ -1,19 +1,19 @@
-import requests
-from bs4 import BeautifulSoup
-import pandas
+import requests as rq 
+from bs4 import BeautifulSoup as bs
+import pandas as pd
 import time
 
-# Create input fields, empty list
+# Input fields, empty list for scrape results
 location = input('City: ')
 query = input('Search: ')
-pages = int(input('Pages of results: '))+1
+pages = int(input('Max pages of results: '))+1
 main_list = []
 
 # BeautifulSoup args, scraper root element
 def extract(url):
     headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/105.0.0.0 Safari/537.36'}
-    r = requests.get(url, headers=headers)
-    soup = BeautifulSoup(r.content, 'html.parser')
+    r = rq.get(url, headers=headers)
+    soup = bs(r.content, 'html.parser')
     return soup.find_all('div', class_='info')
 
 # Scrape tags, transform and append dictionary to main_list
@@ -47,7 +47,7 @@ def transform(articles):
             ]
 
             for link in follow_links:
-                s = BeautifulSoup(requests.get('http://www.yellowpages.com'+link).content, "lxml")
+                s = bs(rq.get('http://www.yellowpages.com'+link).content, "lxml")
                 try:
                     neighborhood = s.find("dd", class_="neighborhoods").text
                 except: 
@@ -74,26 +74,28 @@ def transform(articles):
                     other_info = ''
 
             business = {
-                'rank': rank,
                 'name': name,
-                'phone': phone,
-                'extra_phones': extra_phones,
                 'email': email,
-                'address': address,
-                'neighborhood': neighborhood,
-                'hours': hours,
+                'phone': phone,
                 'website': website,
-                'social_links': social_links,
-                'categories': categories,
-                'other_info': other_info,
+                'address': address,
+                'YPrank': rank,
+                'YPneighborhood': neighborhood,
+                'YPextra_phones': extra_phones,
+                'YPhours': hours,
+                'YPsocial_links': social_links,
+                'YPcategories': categories,
+                'YPother_info': other_info,
+                'YPsearch_location': location,
+                'YPsearch_term': query,
             }
             main_list.append(business)
     return
 
 # Dataframe for main_list, csv export args
 def load():
-    df = pandas.DataFrame(main_list)
-    df.to_csv(f'YPexports/{location}_{query}.csv', index=False)
+    df = pd.DataFrame(main_list)
+    df.to_csv(f'exports/yp_{location}_{query}.csv', index=False)
 
 # Loop for number of pages entered
 for x in range(1,pages):
@@ -103,4 +105,4 @@ for x in range(1,pages):
     time.sleep(2)
 
 load()
-print(f'Saved to {location}_{query}.csv')
+print(f'Saved YP scrape to exports/yp_{location}_{query}.csv')
