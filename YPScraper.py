@@ -2,12 +2,17 @@ import requests as rq
 from bs4 import BeautifulSoup as bs
 import pandas as pd
 import time
+import datetime;
 
 # Input fields, empty list for scrape results
 location = input('City: ')
 query = input('Search: ')
 pages = int(input('Max pages of results: '))+1
 main_list = []
+
+# Store current time
+ct = datetime.datetime.now()
+ts = ct.timestamp()
 
 # BeautifulSoup args, scraper root element
 def extract(url):
@@ -88,6 +93,7 @@ def transform(articles):
                 'YPother_info': other_info,
                 'YPsearch_location': location,
                 'YPsearch_term': query,
+                'TPsearch_datetime': ts,
             }
             main_list.append(business)
     return
