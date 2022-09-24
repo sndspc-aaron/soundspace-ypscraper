@@ -2,7 +2,7 @@ import requests as rq
 from bs4 import BeautifulSoup as bs
 import pandas as pd
 import time
-import datetime;
+import datetime
 
 # Input fields, empty list for scrape results
 location = input('City: ')
