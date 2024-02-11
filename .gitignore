@@ -1,0 +1,12 @@
+# Exported files
+/exports/
+/saved/
+
+# Lists for the scrape queries and cities
+/data/*
+
+# Utility functions
+/utils/
+
+# Node
+/node_modules/
