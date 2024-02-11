@@ -1,26 +1,33 @@
-import requests as rq
+import aiohttp
+import asyncio
 from bs4 import BeautifulSoup as bs
 import pandas as pd
 from datetime import datetime
 import os
-from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+from urllib.parse import urlparse, parse_qsl, quote
+import config
 import time
-from urllib.parse import urlparse, parse_qsl
+from tqdm import tqdm
 
-# Initialize cache
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 cache = {}
 
-def cached_request(url, session):
+async def cached_request(url, session):
     if url not in cache:
         try:
-            response = session.get(url)
-            response.raise_for_status()
-            cache[url] = response
-        except rq.RequestException as e:
-            print(f"Request error: {e}")
+            async with session.get(url) as response:
+                response.raise_for_status()
+                cache[url] = await response.text()
+        except aiohttp.ClientError as e:
+            logging.error(f"Request error for URL {url}: {e}")
             return None
     return cache[url]
+
+def clear_cache():
+    global cache
+    cache = {}
 
 def read_lines_from_file(file_path):
     try:
@@ -31,19 +38,21 @@ def read_lines_from_file(file_path):
         print(f"File error: {e}")
         return []
 
-def extract(url, session):
-    headers = {'User-Agent': 'Mozilla/5.0 ...'}
+async def extract(url, session):
     try:
-        response = session.get(url, headers=headers)
-        response.raise_for_status()
-        soup = bs(response.content, 'lxml')
-        return soup.find_all('div', class_='info')
-    except rq.RequestException as e:
-        print(f"Request error: {e}")
+        content = await cached_request(url, session)
+        if content:
+            soup = bs(content, 'lxml')
+            return soup.find_all('div', class_='info')
+        else:
+            logging.warning(f"No content received from URL: {url}")
+            return []
+    except aiohttp.ClientError as e:
+        logging.error(f"Request error for URL {url}: {e}")
         return []
 
 def extract_business_info(item, query):
-    business_url = f"http://www.yellowpages.com{item.find('a', class_='business-name')['href']}" if item.find('a', class_='business-name') else ''
+    business_url = f"{config.DOMAIN}{item.find('a', class_='business-name')['href']}" if item.find('a', class_='business-name') else ''
     rank = item.find('h2', class_='n').text.split('.')[0] if item.find('h2', class_='n') else ''
     return {
         'name': item.find('a', class_='business-name').text if item.find('a', class_='business-name') else '',
@@ -54,56 +63,54 @@ def extract_business_info(item, query):
         f"{query}_rank": rank
     }
 
-def transform(articles, location, query, business_data, session):
+async def transform(articles, location, query, business_data, session):
     for item in articles:
         info = extract_business_info(item, query)
         unique_id = (info['name'], info['address'])
 
-        business_data.setdefault(unique_id, info).update({
-            'location': location,
-            'search_datetime': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
+        if ',' in location:
+            city, state = location.split(', ', 1)
+        else:
+            city, state = location, ''
 
-        process_follow_links(item, unique_id, business_data, session)
+        if unique_id in business_data:
+            existing_info = business_data[unique_id]
+            existing_info.update(info)
+            existing_info['city'] = city
+            existing_info['state'] = state
+            existing_info['search_datetime'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            info.update({
+                'city': city,
+                'state': state,
+                'search_datetime': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            business_data[unique_id] = info
+
+        await process_follow_links(item, unique_id, business_data, session)
 
     return business_data
 
-def process_follow_links(item, unique_id, business_data, session):
+async def process_follow_links(item, unique_id, business_data, session):
     follow_links = [a['href'] for a in item.find_all('a', class_='business-name') if "#" not in a['href']]
     for link in follow_links:
-        details_response = cached_request('http://www.yellowpages.com' + link, session)
+        details_response = await cached_request(config.DOMAIN + link, session)
         if details_response:
-            details_page = bs(details_response.content, "lxml")
+            details_page = bs(details_response, "lxml")
             update_business_details(unique_id, business_data, details_page)
-            space_image_link = extract_space_image(details_page, session)
+            space_image_link = await extract_space_images(details_page, session)
             if space_image_link:
                 business_data[unique_id]['space_image'] = space_image_link
 
-def process_follow_links(item, unique_id, business_data, session):
-    follow_links = [a['href'] for a in item.find_all('a', class_='business-name') if "#" not in a['href']]
-    for link in follow_links:
-        details_response = cached_request('http://www.yellowpages.com' + link, session)
-        if details_response:
-            details_page = bs(details_response.content, "lxml")
-            update_business_details(unique_id, business_data, details_page)
-            space_image_link = extract_space_images(details_page, session)
-            if space_image_link:
-                business_data[unique_id]['space_image'] = space_image_link
-
-def extract_space_images(details_page, session):
-    # Find the 'media-thumbnail collage-pic' link and follow it
+async def extract_space_images(details_page, session):
     media_thumbnail_link = details_page.find('a', class_='media-thumbnail collage-pic')
     if media_thumbnail_link:
-        gallery_link = 'http://www.yellowpages.com' + media_thumbnail_link['href']
-        gallery_response = cached_request(gallery_link, session)
+        gallery_link = config.DOMAIN + media_thumbnail_link['href']
+        gallery_response = await cached_request(gallery_link, session)
         if gallery_response:
-            gallery_page = bs(gallery_response.content, 'lxml')
-            
-            # Find all links with 'data-media' attribute
+            gallery_page = bs(gallery_response, 'lxml')
             data_media_links = gallery_page.find_all('a', attrs={'data-media': True})
             image_urls = [link.find('img')['src'] for link in data_media_links if link.find('img')]
-            
-            # Return a comma-separated string of image URLs
             return ', '.join(image_urls)
     return None
 
@@ -147,87 +154,84 @@ def extract_detailed_hours(details_page):
     return ''
 
 def save_to_csv(business_data, filename):
+    base_columns = config.DFCOL_ORDER
+
+    dynamic_columns = set()
+    for data in business_data.values():
+        dynamic_columns.update(data.keys())
+
+    dynamic_columns.difference_update(base_columns)
+
+    combined_columns = sorted(dynamic_columns) + base_columns
+    new_df = pd.DataFrame.from_dict(business_data, orient='index')
+    new_df = new_df.reindex(columns=combined_columns)
+
     if not os.path.exists('exports'):
         os.makedirs('exports')
 
-    # Check if the file already exists
-    file_path = f'exports/{filename}'
-    if os.path.exists(file_path):
-        # Load existing data
-        existing_df = pd.read_csv(file_path)
-        # Convert business_data to DataFrame
-        new_df = pd.DataFrame.from_dict(business_data, orient='index')
-        # Combine new data with existing data
-        combined_df = pd.concat([existing_df, new_df]).drop_duplicates().reset_index(drop=True)
-    else:
-        # Convert business_data to DataFrame
-        combined_df = pd.DataFrame.from_dict(business_data, orient='index')
+    file_path = os.path.join(config.EXPORTS_PATH, filename)
+    new_df = pd.DataFrame.from_dict(business_data, orient='index')
 
-    # Ensure 'space_image' column is included
-    if 'space_image' not in combined_df.columns:
-        combined_df['space_image'] = None
+    new_df = new_df.reindex(columns=combined_columns)
 
-    # Rearrange columns with term ranks first, 'slogan', 'general_info', 'yp_url', and 'space_image' at the end
-    cols = combined_df.columns.tolist()
-    rank_cols = [col for col in cols if '_rank' in col]
-    other_cols = [col for col in cols if col not in rank_cols + ['slogan', 'general_info', 'yp_url', 'space_image']]
-    combined_df = combined_df[rank_cols + other_cols + ['slogan', 'general_info', 'yp_url', 'space_image']]
+    new_df.to_csv(file_path, index=False)
+    
+async def concurrent_extraction(urls, session):
+    tasks = [asyncio.create_task(extract(url, session)) for url in urls]
+    results = await asyncio.gather(*tasks)
+    return zip(urls, results)
 
-    # Save the combined DataFrame to CSV
-    combined_df.to_csv(file_path, index=False)
-
-def concurrent_extraction(urls, session):
-    results = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_url = {executor.submit(extract, url, session): url for url in urls}
-        for future in as_completed(future_to_url):
-            url = future_to_url[future]
-            try:
-                data = future.result()
-                results.append((url, data))
-            except Exception as e:
-                print(f"Request generated an exception: {e}")
-    return results
-
-def generate_urls(cities, queries, pages):
+def generate_urls(cities, queries, pages, domain):
     urls = []
     for city in cities:
-        formatted_city = rq.utils.quote(city)
+        formatted_city = quote(city)
         for query in queries:
             for x in range(1, pages + 1):
-                url = f'https://www.yellowpages.com/search?search_terms={query}&geo_location_terms={formatted_city}&page={x}'
+                url = f'{domain}/search?search_terms={query}&geo_location_terms={formatted_city}&page={x}'
                 urls.append(url)
     return urls
 
-def main(cities_file, queries_file, pages):
+async def main():
+    clear_cache()
     start_time = time.time()
-    cities = read_lines_from_file(cities_file)
-    queries = read_lines_from_file(queries_file)
+    cities = read_lines_from_file(config.CITIES_FILE_PATH)
+    queries = read_lines_from_file(config.QUERIES_FILE_PATH)
+    
     business_data = {}
-    session = rq.Session()
+    
+    async with aiohttp.ClientSession() as session:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+        }
+        session.headers.update(headers)
 
-    urls = generate_urls(cities, queries, pages)
-    total_iterations = len(urls)
-    with tqdm(total=total_iterations, desc="Scraping Progress", unit="city") as pbar:
-        articles = concurrent_extraction(urls, session)
-        for url, article_data in articles:
-            # Extract city and query from URL using urlparse and parse_qsl
-            parsed_url = urlparse(url)
-            query_dict = dict(parse_qsl(parsed_url.query))
-            city = query_dict.get('geo_location_terms', '')
-            query = query_dict.get('search_terms', '')
+        urls = generate_urls(cities, queries, config.PAGE_LIMIT, config.DOMAIN)
+        chunks = [urls[i:i + config.CONCURRENT_REQUESTS] for i in range(0, len(urls), config.CONCURRENT_REQUESTS)]
 
-            transform(article_data, city, query, business_data, session)
-            pbar.update(1)
-
-    save_to_csv(business_data, 'combined_yp_scrape.csv')
+        with tqdm(total=len(urls), desc="Scraping Progress", unit="pages") as pbar:
+            for chunk in chunks:
+                tasks = [asyncio.create_task(process_url(url, session, business_data)) for url in chunk]
+                await asyncio.gather(*tasks)
+                pbar.update(len(chunk))
 
     end_time = time.time()
+    end_time_str = time.strftime('%m_%d_%Y_%H-%M-%S', time.localtime(end_time))
+    save_to_csv(business_data, f'ypscrape_{end_time_str}.csv')
+
     elapsed_time = end_time - start_time
     hours, rem = divmod(elapsed_time, 3600)
     minutes, seconds = divmod(rem, 60)
-    print(f"Saved YP scrape to exports/combined_yp_scrape.csv")
-    print(f"Total time taken: {int(hours)} hours, {int(minutes)} minutes, {int(seconds)} seconds")
+    logging.info(f"Saved results to {config.EXPORTS_PATH}/ypscrape_{end_time_str}.csv")
+    logging.info(f"Total time taken: {int(hours)} hours, {int(minutes)} minutes, {int(seconds)} seconds")
+
+async def process_url(url, session, business_data):
+    article_data = await extract(url, session)
+    parsed_url = urlparse(url)
+    query_dict = dict(parse_qsl(parsed_url.query))
+    city = query_dict.get('geo_location_terms', '')
+    query = query_dict.get('search_terms', '')
+
+    await transform(article_data, city, query, business_data, session)
 
 if __name__ == "__main__":
-    main('cities.txt', 'queries.txt', 1)
+    asyncio.run(main())
